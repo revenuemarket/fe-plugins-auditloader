@@ -42,12 +42,14 @@ public class KafkaProducerManager {
     private AuditEventSerializer serializer;
     private KafkaConfig config;
     private KafkaMetrics metrics;
+    private Map<String, String> rawConfig;
 
     private final AtomicLong successCount = new AtomicLong(0);
     private final AtomicLong failureCount = new AtomicLong(0);
 
     public KafkaProducerManager(Map<String, String> configMap) {
         this.config = new KafkaConfig(configMap);
+        this.rawConfig = configMap;
         this.serializer = new AuditEventSerializer();
         this.metrics = new KafkaMetrics();
     }
@@ -60,8 +62,8 @@ public class KafkaProducerManager {
 
         // Required settings
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, config.getBootstrapServers());
-        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
-        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
 
         // Performance optimization
         props.put(ProducerConfig.BATCH_SIZE_CONFIG, config.getBatchSize());
@@ -93,6 +95,22 @@ public class KafkaProducerManager {
         }
         if (config.getSslTruststorePassword() != null) {
             props.put("ssl.truststore.password", config.getSslTruststorePassword());
+        }
+
+        ClassLoader pluginClassLoader = KafkaProducerManager.class.getClassLoader();
+        for (Map.Entry<String, String> entry : rawConfig.entrySet()) {
+            if (entry.getKey().startsWith("kafka.producer.")) {
+                String producerKey = entry.getKey().substring("kafka.producer.".length());
+                if ("sasl.client.callback.handler.class".equals(producerKey)) {
+                    try {
+                        props.put(producerKey, Class.forName(entry.getValue(), true, pluginClassLoader));
+                    } catch (ClassNotFoundException e) {
+                        throw new IllegalArgumentException("Unable to load Kafka producer class: " + entry.getValue(), e);
+                    }
+                } else {
+                    props.put(producerKey, entry.getValue());
+                }
+            }
         }
 
         this.producer = new KafkaProducer<>(props);
