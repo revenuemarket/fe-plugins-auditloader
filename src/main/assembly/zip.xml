@@ -27,7 +27,7 @@ under the License.
         <fileSet>
             <directory>target</directory>
             <includes>
-                <include>*.jar</include>
+                <include>auditloader.jar</include>
             </includes>
             <outputDirectory>/</outputDirectory>
         </fileSet>
