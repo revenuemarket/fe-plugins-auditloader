@@ -60,6 +60,17 @@ public class AuditLoaderPlugin extends Plugin implements AuditPlugin {
     private long lastLoadTime = 0;
     private BlockingQueue<AuditEvent> auditEventQueue;
     private List<AuditEvent> eventBatch;
+    // Accumulated statement bytes in eventBatch.
+    //
+    // WHY: the size-based flush used to compare eventBatch.size() -- the ELEMENT COUNT --
+    // against conf.maxBatchSize, which is a BYTE budget (50MB). That needs ~52 million
+    // events in one batch to fire, so it never did: only the 60s timer flushed.
+    // A batch then held a whole minute of audit traffic. Measured on a production
+    // cluster on 2026-09-19: 1,016 events / 98.5MB of statements per minute at rest,
+    // 1,527 / 145MB under load. StringBuilder stores 2 bytes per char and doubles via
+    // Arrays.copyOf while growing, so one batch reached several hundred MB and the FE
+    // died with OutOfMemoryError (-Xmx8192m), taking the leader with it.
+    private long eventBatchBytes;
     private OutputRouter outputRouter;
     private Thread loadThread;
 
@@ -263,8 +274,20 @@ public class AuditLoaderPlugin extends Plugin implements AuditPlugin {
     }
 
     private void assembleAudit(AuditEvent event) {
-        // Add event to batch for output router processing
+        // Add event to batch for output router processing.
+        //
+        // No drop here: LoadWorker calls loadIfNecessary() after every event, so the
+        // byte budget below flushes the batch instead. Dropping would be worse -- the
+        // batch would sit just under the cap, never trip the size flush, and every
+        // further event would be thrown away until the 60s timer came round.
+        // Overshoot is bounded by one event (<= max_stmt_length).
         eventBatch.add(event);
+        eventBatchBytes += estimateEventBytes(event);
+    }
+
+    /** Statement bytes dominate an audit row; the fixed columns are noise next to a 1MB stmt. */
+    private long estimateEventBytes(AuditEvent event) {
+        return event.stmt == null ? 0L : Math.min(event.stmt.length(), conf.maxStmtLength);
     }
 
     private String getQueryId(String prefix, AuditEvent event) {
@@ -303,7 +326,7 @@ public class AuditLoaderPlugin extends Plugin implements AuditPlugin {
     }
 
     private void loadIfNecessary() {
-        if (eventBatch.size() < conf.maxBatchSize && System.currentTimeMillis() - lastLoadTime < conf.maxBatchIntervalSec * 1000) {
+        if (eventBatchBytes < conf.maxBatchSize && System.currentTimeMillis() - lastLoadTime < conf.maxBatchIntervalSec * 1000) {
             return;
         }
         if (eventBatch.isEmpty()) {
@@ -320,6 +343,7 @@ public class AuditLoaderPlugin extends Plugin implements AuditPlugin {
         } finally {
             // clear the batch for next round
             eventBatch.clear();
+            eventBatchBytes = 0L;
         }
     }
 
